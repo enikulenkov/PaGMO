@@ -68,7 +68,7 @@ typedef struct dlnode {
   struct dlnode *prevy;
   struct dlnode *nextz;
   struct dlnode *prevz;
-  double xrightbelow; //x value of the closest point (according to x) with lower y and z values
+  double xrightbelow; /*x value of the closest point (according to x) with lower y and z values */
 } dlnode_t;
 
 
@@ -151,7 +151,7 @@ static void free_sentinels(dlnode_t * list){
         
 }
 
-//box
+/*box */
 typedef struct bx{
     double lx, ly, lz;
     double ux, uy, uz;
@@ -160,13 +160,13 @@ typedef struct bx{
     struct bx * prev;
 }box;
 
-//box list
+/*box list */
 typedef struct bxl{
     box * head;
     box * tail;
 }boxlist;
 
-//note: it is not necessary to define uz
+/*note: it is not necessary to define uz */
 static box * new_box(double lx, double ly, double lz, double ux, double uy, double uz){
     box * b = (box *)malloc(sizeof(box));
     
@@ -181,7 +181,7 @@ static box * new_box(double lx, double ly, double lz, double ux, double uy, doub
     return b;
 }
 
-//push_left == push_head
+/*push_left == push_head */
 static void push_left(boxlist * bl, box * b){
     b->next = bl->head;
     bl->head->prev = b;
@@ -191,7 +191,7 @@ static void push_left(boxlist * bl, box * b){
 }
 
 
-//may be empty
+/*may be empty */
 static void push_left_e(boxlist * bl, box * b){
     if(bl->head == NULL){
         bl->head = b;
@@ -211,7 +211,7 @@ static void push_left_e(boxlist * bl, box * b){
 }
 
 
-//box b is freed and its volume is returned
+/*box b is freed and its volume is returned */
 static double close_box(box *b){
         double volume = (b->ux - b->lx) * (b->uy - b->ly) * (b->uz - b->lz);
         free(b);
@@ -235,7 +235,7 @@ static double close_boxes_right(boxlist *bl, double x, double uz){
         volume += close_box(b);
         b = bl->tail;
     }
-    //b = bl->tail;
+    /*b = bl->tail; */
         if(x < b->ux){
         b->uz = uz;
         volume += shrink_box(b, x);
@@ -346,18 +346,17 @@ static boxlist * init_box_list(dlnode_t *p, dlnode_t * ynext){
     
     double previous_x = p->xrightbelow;
 
-    dlnode_t * q = ynext; // y is swept in ascending order
+    dlnode_t * q = ynext; /* y is swept in ascending order */
 
     boxlist * bl = (boxlist *)malloc(sizeof(boxlist));
     box * b = (box *)malloc(sizeof(box));
     
     b->prev = b->next = NULL;
-    bl->head = bl->tail = b; //box b (sentinel) will be removed later
+    bl->head = bl->tail = b; /*box b (sentinel) will be removed later*/
 
-    //box limits in x and y are defined (vertical boxes)
+    /*box limits in x and y are defined (vertical boxes) */
     while(q->x[0] > p->x[0] || q->x[2] > p->x[2]){
 
-        // =
         if(q->x[2] <= p->x[2] && q->x[0] < previous_x && q->x[0] > p->x[0]){
             b = new_box(q->x[0], p->x[1], p->x[2], previous_x, q->x[1], 0);
             push_left(bl, b);
@@ -372,7 +371,7 @@ static boxlist * init_box_list(dlnode_t *p, dlnode_t * ynext){
     push_left(bl, b);
     
     
-    //the box created in the beginning is removed
+    /*the box created in the beginning is removed */
     bl->tail = bl->tail->prev;
     free(bl->tail->next);
     bl->tail->next = NULL;
@@ -393,17 +392,17 @@ static double update_boxes(boxlist * bl, dlnode_t *p, dlnode_t * znext){
     while(bl->head != NULL){      
             if(q->x[0] <= p->x[0]){
 
-                if(q->x[1] <= p->x[1]){ // p is dominated in x and y
+                if(q->x[1] <= p->x[1]){ /* p is dominated in x and y */
 
-                    //close all boxes
-                    //update volume                 
-                    //last iteration
+                    /*close all boxes*/
+                    /*update volume */
+                    /*last iteration */
                      volume += close_all_boxes(bl, q->x[2]);
                 }else{
                     
-                    //update z
-                    //close boxes in the left
-                    //update volume
+                    /*update z*/
+                    /*close boxes in the left*/
+                    /*update volume*/
                      volume += close_boxes_left(bl, q->x[1], q->x[2]);
                 }
 
@@ -412,13 +411,13 @@ static double update_boxes(boxlist * bl, dlnode_t *p, dlnode_t * znext){
                 }
 
                 
-            }else{ //since q does not dominate p and p does not dominate q, q has to
-                    //to be to the right of p and below p
+            }else{ /*since q does not dominate p and p does not dominate q, q has to*/
+                    /*to be to the right of p and below p*/
                 
 
-                //update z
-                //closes boxes in the right
-                //update volume
+                /*update z*/
+                /*closes boxes in the right*/
+                /*update volume*/
                  volume += close_boxes_right(bl, q->x[0], q->x[2]);
 
             }
@@ -434,23 +433,21 @@ static double update_boxes(boxlist * bl, dlnode_t *p, dlnode_t * znext){
 }
 
 
-//corresponds to HV4D - contribution function of the pseudocode
+/*corresponds to HV4D - contribution function of the pseudocode*/
 static double
 hv_increment3DA(dlnode_t *p, dlnode_t * ynext, dlnode_t *znext){
 
      boxlist * bl = init_box_list(p, ynext);
-//      if(bl == NULL)
-//          return 0;
 
     return update_boxes(bl, p, znext);
 }
 
 
 
-//inner cycle (sweeps points according to coordinate z)
-//note: returns the contribution of p only
-//Function responsible for keeping points sorted according to coordinates y and z,
-//for updating xrightbelow and for removing dominated points
+/*inner cycle (sweeps points according to coordinate z)
+  note: returns the contribution of p only
+  Function responsible for keeping points sorted according to coordinates y and z,
+  for updating xrightbelow and for removing dominated points */
 static double
 hv_increment3D(dlnode_t *list, dlnode_t *p, const double * ref){
     double loss = 0, gain;
@@ -470,11 +467,11 @@ hv_increment3D(dlnode_t *list, dlnode_t *p, const double * ref){
         }else{
 
             if(q->x[2] > zprev->x[2] && (q->x[2] < p->x[2] || (q->x[2] == p->x[2] &&  q->x[1] <= p->x[1]))){
-                 //because of xrightbelow, in other to avoid height 0 boxes (in spite of not causing wrong results)
+                 /*because of xrightbelow, in other to avoid height 0 boxes (in spite of not causing wrong results)*/
                 zprev = q;
             }
 
-            if(q->x[1] > yprev->x[1] && (q->x[1] < p->x[1] || (q->x[1] == p->x[1] &&  q->x[2] <= p->x[2]))){ //testequal.4d.6
+            if(q->x[1] > yprev->x[1] && (q->x[1] < p->x[1] || (q->x[1] == p->x[1] &&  q->x[2] <= p->x[2]))){ /*testequal.4d.6*/
                 yprev = q;
             }
             
@@ -491,7 +488,7 @@ hv_increment3D(dlnode_t *list, dlnode_t *p, const double * ref){
 
     gain = hv_increment3DA(p, yprev->nexty, zprev->nextz);
 
-    //add p to the lists of coordinates two and three
+    /*add p to the lists of coordinates two and three*/
     insert_after_z(p, zprev);
     insert_after_y(p, yprev);
 
@@ -499,14 +496,14 @@ hv_increment3D(dlnode_t *list, dlnode_t *p, const double * ref){
 }
 
 
-//outer cycle (sweeps list L_4)
+/*outer cycle (sweeps list L_4)*/
 static double
 hv(dlnode_t *list, int c, const double * ref)
 {
 
     dlnode_t *p = list;
-    double hyperv = 0; //hvol4D
-    double hypera = 0; //hvol3D
+    double hyperv = 0; /*hvol4D*/
+    double hypera = 0; /*hvol3D*/
         
     int i;
     for (i = 0; i < c; i++) {
