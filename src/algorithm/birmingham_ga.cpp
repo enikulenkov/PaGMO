@@ -27,6 +27,11 @@
 #include <boost/random/variate_generator.hpp>
 #include <boost/random/normal_distribution.hpp>
 #include <boost/math/special_functions/round.hpp>
+
+#include <gsl/gsl_deriv.h>
+#include <gsl/gsl_multimin.h>
+#include <gsl/gsl_vector.h>
+
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -38,59 +43,87 @@
 #include "birmingham_ga.h"
 #include "../problem/base_stochastic.h"
 
+#define Z(i) ((i)*3 +2)
+#define COORDS_CNT 3
+#define  SQR(_a) ((_a)*(_a))
+
 namespace pagmo { namespace algorithm {
 
-/// Constructor.
-/**
- * Allows to specify in detail all the parameters of the algorithm.
- *
- * @param[in] gen Number of generations to evolve.
- * @param[in] cr Crossover probability (of each allele if binomial crossover)
- * @param[in] m Mutation probability (of each allele)
- * @param[in] elitism The best individual is reinserted in the population each elitism generations
- * @param[in] mut Mutation type. One of birmingham_ga::mutation::GAUSSIAN, birmingham_ga::mutation::RANDOM
- * @param[in] width Mutation width. When gaussian mutation is selected is the width of the mutation
- * @param[in] sel Selection type. One of birmingham_ga::selection::BEST20, birmingham_ga::selection::ROULETTE
- * @param[in] cro Crossover type. One of birmingham_ga::crossover::BINOMIAL, birmingham_ga::crossover::EXPONENTIAL
- * @param[in] max_coord Maximum coordinate on X,Y,Z axis for molecule
- * @throws value_error if gen is negative, crossover probability is not \f$ \in [0,1]\f$, mutation probability is not \f$ \in [0,1]\f$,
- * elitism is <=0
- *
- */
-birmingham_ga::birmingham_ga(int gen, const double &cr, const double &m, int elitism, mutation::type mut, double width, selection::type sel, crossover::type cro, const double &max_coord)
-	:base(),m_gen(gen),m_cr(cr),m_m(m),m_elitism(elitism),m_mut(mut,width),m_sel(sel),m_cro(cro), m_max_coord(max_coord)
+birmingham_ga::birmingham_ga(const int gen,
+      const double &crossover_rate,
+      const double &binom_rate,
+      const double &min_atom_dist,
+	    mutation *muts,
+      int mut_count,
+      int elitism,
+	    selection::type sel,
+	    crossover::type cro,
+      const double &max_coord,
+      const double &bfgs_step_size,
+      const double &bfgs_tol)
 {
-	if (gen < 0) {
-		pagmo_throw(value_error,"number of generations must be nonnegative");
-	}
-	if (cr > 1 || cr < 0) {
-		pagmo_throw(value_error,"crossover probability must be in the [0,1] range");
-	}
-	if (m < 0 || m > 1) {
-		pagmo_throw(value_error,"mutation probability must be in the [0,1] range");
-	}
-	if (elitism < 1) {
-		pagmo_throw(value_error,"elitisim must be greater than zero");
-	}
-	if (width <0 || width >1) {
-		pagmo_throw(value_error,"mutation width must be in the [0,1] range");
-	}
+  m_gen = gen;
+  m_crossover_rate = crossover_rate;
+  m_binom_rate = binom_rate;
+  m_min_atom_dist = min_atom_dist;
+  m_elitism = elitism;
+  m_selection_type = sel;
+  m_crossover_type = cro;
+  m_max_coord = max_coord;
+  m_bfgs_step_size = bfgs_step_size;
+  m_bfgs_tol = bfgs_tol;
+  m_mut_count = mut_count;
 
+  for (int i=0; i < mut_count; i++)
+  {
+    m_mutations[i] = muts[i];
+  }
 }
 
 /// Clone method.
 base_ptr birmingham_ga::clone() const
 {
-	return base_ptr(new birmingham_ga(*this));
+  return base_ptr(new birmingham_ga(*this));
+}
+
+
+bool birmingham_ga::check_cluster(decision_vector &x) const
+{
+  //for (population::size_type i=0; i < x.size(); i++)
+  //{
+    //if (abs(x[i]) > 2*m_max_coord)
+    //{
+      //return false;
+    //}
+  //}
+
+  for (population::size_type i=0; i < x.size()/COORDS_CNT - 1; i++)
+  {
+    for (population::size_type j=i+1; j < x.size()/COORDS_CNT; j++)
+    {
+      double dist = SQR(x[i*COORDS_CNT] - x[j*COORDS_CNT]) +
+                    SQR(x[i*COORDS_CNT+1] - x[j*COORDS_CNT+1]) +
+                    SQR(x[i*COORDS_CNT+2] - x[j*COORDS_CNT+2]);
+
+      if (dist < m_min_atom_dist*m_min_atom_dist)
+      {
+        return false;
+      }
+    }
+  }
+
+  return true;
 }
 
 
 void birmingham_ga::randomize_cluster(decision_vector &x)
 {
+  boost::uniform_real<double> rand_coord(-m_max_coord, m_max_coord);
   double step = 0.5;
   int step_count = m_max_coord * 2 / step;
   boost::random::mt19937 rng;
   boost::random::uniform_int_distribution<> rand_dist(0,step_count);
+  boost::uniform_real<double> rand_angle(0, 2*3.1415);
 
   for (population::size_type i = 0; i < x.size(); i++)
   {
@@ -101,10 +134,10 @@ void birmingham_ga::randomize_cluster(decision_vector &x)
 
 int compare_function(const void *a,const void *b)
 {
-  double *x = (double *) a;
-  double *y = (double *) b;
-  if (*x < *y) return -1;
-  else if (*x > *y) return 1;
+  double *atom1 = (double *) a;
+  double *atom2 = (double *) b;
+  if (atom1[2] < atom2[2]) return -1;
+  else if (atom1[2] > atom2[2]) return 1;
   return 0;
 }
 
@@ -130,14 +163,15 @@ void matr_vector_mult(double *matr, double *vec)
   }
 }
 
-void make_rotation(decision_vector &vec)
+void birmingham_ga::make_rotation(decision_vector &vec) const
 {
-  boost::random::mt19937 rng;
   boost::uniform_real<double> rand_angle(0, 2*3.1415);
   double phi;
   double cos_phi;
   double sin_phi;
   const int n = 3;
+
+  decision_vector vec_copy = vec;
 
   double rot_matr[3*3];
 
@@ -146,7 +180,7 @@ void make_rotation(decision_vector &vec)
    * 0 cos_phi -sin_phi
    * 0 sin_phi cos_phi */
   {
-    phi = rand_angle(rng);
+    phi = rand_angle(m_drng);
     cos_phi = cos(phi);
     sin_phi = sin(phi);
 
@@ -164,19 +198,19 @@ void make_rotation(decision_vector &vec)
   }
 
   /* Rotation along Y axis */
-  /* cos_phi  0  -sin_phi 
+  /* cos_phi  0  sin_phi 
    * 0        1  0 
-   * sin_phi  0  cos_phi */
+   * -sin_phi  0  cos_phi */
   {
-    phi = rand_angle(rng);
+    phi = rand_angle(m_drng);
     cos_phi = cos(phi);
     sin_phi = sin(phi);
 
     memset(rot_matr, 0, sizeof(rot_matr));
     rot_matr[0] = cos_phi;
-    rot_matr[2] = -sin_phi;
+    rot_matr[2] = sin_phi;
     rot_matr[n+1] = 1;
-    rot_matr[2*n] = sin_phi;
+    rot_matr[2*n] = -sin_phi;
     rot_matr[2*n+2] = cos_phi;
 
     for (population::size_type i=0; i < vec.size(); i+=3)
@@ -187,88 +221,235 @@ void make_rotation(decision_vector &vec)
 }
 
 
+/*
 static inline int splice_atoms_cnt(decision_vector &vec, double z_coord, bool dir_up)
 {
   int res = 0;
 
   for (population::size_type i = 0; i < vec.size()/3; i++)
   {
-    res += (dir_up && (vec[i*3 + 2] >= z_coord)) || (!dir_up && (vec[i*3 +2] <= z_coord));
+    res += (dir_up && (vec[i*3 + 2] >= z_coord)) || (!dir_up && (vec[i*3 +2] < z_coord));
   }
 
   return res;
+}
+*/
+
+typedef struct objfun_params_s
+{
+  problem::base const *p;
+  decision_vector x;
+  fitness_vector f;
+  double step_size;
+}
+objfun_params_t;
+
+/// Objective function wrapper.
+/**
+ * @param[in] v pointer to the gsl_vector representing the decision vector.
+ * @param[in] params pointer to extra parameters for the internal function.
+ *
+ * @return the fitness of the input decision vector.
+ */
+double objfun_wrapper(const gsl_vector *v, void *params)
+{
+  objfun_params_t *par = (objfun_params_t *)params;
+  // Size of the continuous part of the problem.
+  const problem::base::size_type cont_size = par->p->get_dimension() - par->p->get_i_dimension();
+  // Fill up the continuous part of temporary storage with the contents of v.
+  for (problem::base::size_type i = 0; i < cont_size; ++i) {
+    par->x[i] = gsl_vector_get(v,i);
+  }
+  // Compute the objective function.
+  par->p->objfun(par->f,par->x);
+  return par->f[0];
+}
+
+
+void d_objfun(const gsl_vector *v, void *params, gsl_vector *df)
+{
+  objfun_params_t *par = (objfun_params_t *)params;
+
+  const problem::base::size_type cont_size = par->p->get_dimension() - par->p->get_i_dimension();
+  double *ret_df = (double *)malloc(cont_size * sizeof(double));
+
+  for (problem::base::size_type i = 0; i < cont_size; ++i)
+  {
+    par->x[i] = gsl_vector_get(v,i);
+  }
+
+  par->p->d_objfun(&par->x[0], cont_size, ret_df);
+
+  for (problem::base::size_type i = 0; i < cont_size; ++i)
+  {
+    gsl_vector_set(df, i, ret_df[i]);
+  }
+  free(ret_df);
+}
+
+
+// Simmultaneous function/derivative computation wrapper for the objective function.
+void fd_objfun_wrapper(const gsl_vector *v, void *params, double *retval, gsl_vector *df)
+{
+  *retval = objfun_wrapper(v,params);
+  d_objfun(v,params,df);
+}
+
+
+void minimize_cluster(decision_vector &vec1, const problem::base &prob)
+{
+  const gsl_multimin_fdfminimizer_type *minimizer_type;
+  gsl_multimin_fdfminimizer *minimizer;
+  gsl_vector *x = NULL; /* Starting point */
+  double step_size = 0.01;
+  double tol = 0.1;
+  objfun_params_t params;
+  const problem::base::size_type cont_size = prob.get_dimension() - prob.get_i_dimension();
+  gsl_multimin_function_fdf gsl_func;
+  double numdiff_step_size = 1e-8;
+  int max_iter = 10;
+
+  params.p = &prob;
+  params.x.resize(vec1.size());
+  params.f.resize(1);
+  params.step_size = numdiff_step_size;
+
+  gsl_func.n = boost::numeric_cast<std::size_t>(cont_size);
+  gsl_func.f = &objfun_wrapper;
+  gsl_func.df = &d_objfun;
+  gsl_func.fdf = &fd_objfun_wrapper;
+  gsl_func.params = (void *)&params;
+
+  /* Alloc memory and initialize starting point */
+  minimizer_type = gsl_multimin_fdfminimizer_vector_bfgs2;
+  minimizer = gsl_multimin_fdfminimizer_alloc(minimizer_type, cont_size);
+
+  x = gsl_vector_alloc(cont_size);
+
+  for (population::size_type i = 0; i < vec1.size(); i++)
+  {
+    gsl_vector_set(x, i, vec1[i]);
+  }
+
+  /* Init the solver */
+  gsl_multimin_fdfminimizer_set(minimizer, &gsl_func, x, step_size, tol);
+
+  /* Iterate */
+  int iter = 0;
+  int status;
+  try {
+    do
+    {
+      ++iter;
+      status = gsl_multimin_fdfminimizer_iterate(minimizer);
+      if (status) {
+        break;
+      }
+      status = gsl_multimin_test_gradient(minimizer->gradient, tol);
+    } while (status == GSL_CONTINUE && iter < max_iter);
+  } catch (const std::exception &e) {
+    // Cleanup and re-throw.
+    gsl_vector_free(x);
+    gsl_multimin_fdfminimizer_free(minimizer);
+    throw e;
+  } catch (...) {
+    // Cleanup and throw.
+    gsl_vector_free(x);
+    gsl_multimin_fdfminimizer_free(minimizer);
+    pagmo_throw(std::runtime_error,"unknown exception caught in minimize_cluster");
+  }
+  // Free up resources.
+  gsl_vector_free(x);
+  gsl_multimin_fdfminimizer_free(minimizer);
+
+  // Check the generated individual and change it to respect the bounds as necessary.
+  for (problem::base::size_type i = 0; i < cont_size; ++i) {
+    if (params.x[i] < prob.get_lb()[i]) {
+      params.x[i] = prob.get_lb()[i];
+    }
+    if (params.x[i] > prob.get_ub()[i]) {
+      params.x[i] = prob.get_ub()[i];
+    }
+  }
+
+  vec1 = params.x;
 }
 
 
 void make_splice(decision_vector &vec1, decision_vector &vec2)
 {
-  std::vector<double> possible_splice_points;
-  int init_guess_idx;
   int atoms_cnt = vec1.size()/3;
-  double splice_point = -1;
-  int spliced_atoms_cnt = 0;
+  int cur_idx1 = atoms_cnt/2;
+  int cur_idx2 = atoms_cnt/2;
+  int init_idx2;
+  bool splice_found = false;
 
-  possible_splice_points.reserve(vec1.size()*2 + 1);
+  /* Sort both decision vectors by Z coordinate */
+  qsort(&vec1[0], atoms_cnt, 3*sizeof(double), compare_function);
+  qsort(&vec2[0], atoms_cnt, 3*sizeof(double), compare_function);
 
-  for (population::size_type i=0; i < vec1.size(); i+=3)
+  /* Find corresponding index to cur_idx1 at vec2 */
+  /* TODO: Possible array bound error? */
+  while (vec2[Z(cur_idx2+1)] < vec1[Z(cur_idx1)])
   {
-    possible_splice_points.push_back(vec1[i+2]);
-    possible_splice_points.push_back(vec2[i+2]);
+    cur_idx2++;
   }
-  possible_splice_points.push_back(0);
-  qsort(&possible_splice_points[0], possible_splice_points.size(), sizeof(double), compare_function);
 
-  init_guess_idx = possible_splice_points.size()/2;
-
-  for (population::size_type i=init_guess_idx ; i < possible_splice_points.size(); i++)
+  while (vec2[Z(cur_idx2)] >= vec1[Z(cur_idx1)])
   {
-    spliced_atoms_cnt = splice_atoms_cnt(vec1, possible_splice_points[i], true)
-                        + splice_atoms_cnt(vec2, possible_splice_points[i], false);
-    if (spliced_atoms_cnt == atoms_cnt)
+    cur_idx2--;
+  }
+
+  //pagmo_assert(cur_idx2 >= 0);
+  //
+  if (cur_idx2 < 0)
+  {
+    return;
+  }
+
+  init_idx2 = cur_idx2;
+
+  /* Search in forward direction from the middle */
+  for ( ; cur_idx1 < atoms_cnt; cur_idx1++)
+  {
+    while ((vec2[Z(cur_idx2+1)] < vec1[Z(cur_idx1)]) && (cur_idx2 < atoms_cnt - 1))
     {
-      splice_point = possible_splice_points[i];
+      cur_idx2++;
+    }
+
+    if (cur_idx2 > atoms_cnt - 1)
+    {
+      break;
+    }
+
+    if (cur_idx1 - 1 == cur_idx2)
+    {
+      splice_found = true;
+      memcpy(&vec1[0], &vec2[0], cur_idx1*3*sizeof(double));
       break;
     }
   }
 
-  if (spliced_atoms_cnt != atoms_cnt)
+  /* Search in backwards direction */
+  if (!splice_found)
   {
-    for (int i=init_guess_idx -1; i >=0; i--)
+    for (cur_idx1 = atoms_cnt/2, cur_idx2 = init_idx2; cur_idx1 > 0; cur_idx1--)
     {
-      spliced_atoms_cnt = splice_atoms_cnt(vec1, possible_splice_points[i], true)
-                          + splice_atoms_cnt(vec2, possible_splice_points[i], false);
-      if (spliced_atoms_cnt == atoms_cnt)
+      while ((vec2[Z(cur_idx2)] >= vec1[Z(cur_idx1)]) && cur_idx2 > 0)
       {
-        splice_point = possible_splice_points[i];
+        cur_idx2--;
+      }
+
+      if (cur_idx2 < 0)
+      {
         break;
       }
-    }
-  }
 
-  if (spliced_atoms_cnt != atoms_cnt)
-  {
-    pagmo_throw(value_error, "Splice operation failed");
-  }
-  else
-  {
-    int k = 0;
-
-    for (int i=0; i < atoms_cnt; i++)
-    {
-      if (vec1[i*3 + 2] >= splice_point)
+      if (cur_idx1 - 1 == cur_idx2)
       {
-        vec1[k*3] = vec1[i*3];
-        vec1[k*3 + 1] = vec1[i*3 + 1];
-        vec1[k*3 + 2] = vec1[i*3 + 2];
-        k++;
-      }
-
-      if (vec2[i*3 + 2] <= splice_point)
-      {
-        vec1[k*3] = vec2[i*3];
-        vec1[k*3 + 1] = vec2[i*3 + 1];
-        vec1[k*3 + 2] = vec2[i*3 + 2];
-        k++;
+        splice_found = true;
+        memcpy(&vec1[0], &vec2[0], cur_idx1*3*sizeof(double));
+        break;
       }
     }
   }
@@ -297,85 +478,61 @@ void birmingham_ga::do_cut_and_splice(decision_vector &vec1, decision_vector &ve
 
 void birmingham_ga::evolve(population &pop) const
 {
-	// Let's store some useful variables.
-	const problem::base &prob = pop.problem();
-	const problem::base::size_type D = prob.get_dimension(), Di = prob.get_i_dimension(), prob_c_dimension = prob.get_c_dimension(), prob_f_dimension = prob.get_f_dimension();
-	const decision_vector &lb = prob.get_lb(), &ub = prob.get_ub();
-	const population::size_type NP = pop.size();
-	const problem::base::size_type Dc = D - Di;
+  // Let's store some useful variables.
+  const problem::base &prob = pop.problem();
+  const problem::base::size_type D = prob.get_dimension(), prob_c_dimension = prob.get_c_dimension(), prob_f_dimension = prob.get_f_dimension();
+  const decision_vector &lb = prob.get_lb(), &ub = prob.get_ub();
+  const population::size_type NP = pop.size();
 
 
-	//We perform some checks to determine wether the problem/population are suitable for birmingham_ga
-	if ( prob_c_dimension != 0 ) {
-		pagmo_throw(value_error,"The problem is not box constrained and birmingham_ga is not suitable to solve it");
-	}
+  //We perform some checks to determine wether the problem/population are suitable for birmingham_ga
+  if ( prob_c_dimension != 0 ) {
+    pagmo_throw(value_error,"The problem is not box constrained and birmingham_ga is not suitable to solve it");
+  }
 
-	if ( prob_f_dimension != 1 ) {
-		pagmo_throw(value_error,"The problem is not single objective and birmingham_ga is not suitable to solve it");
-	}
+  if ( prob_f_dimension != 1 ) {
+    pagmo_throw(value_error,"The problem is not single objective and birmingham_ga is not suitable to solve it");
+  }
 
-	if (NP < 5) {
-		pagmo_throw(value_error,"for birmingham_ga at least 5 individuals in the population are needed");
-	}
+  if (NP < 5) {
+    pagmo_throw(value_error,"for birmingham_ga at least 5 individuals in the population are needed");
+  }
 
-	// Get out if there is nothing to do.
-	if (m_gen == 0) {
-		return;
-	}
-	// Some vectors used during evolution are allocated here.
-	decision_vector dummy(D,0);			//used for initialisation purposes
-	std::vector<decision_vector > X(NP,dummy), Xnew(NP,dummy);
+  // Get out if there is nothing to do.
+  if (m_gen == 0) {
+    return;
+  }
+  // Some vectors used during evolution are allocated here.
+  decision_vector dummy(D,0);      //used for initialisation purposes
+  std::vector<decision_vector > X(NP,dummy), Xnew(NP,dummy);
 
-	std::vector<fitness_vector > fit(NP);		//fitness
+  std::vector<fitness_vector > fit(NP);    //fitness
 
-	fitness_vector bestfit;
-	decision_vector bestX(D,0);
+  fitness_vector bestfit;
+  decision_vector bestX(D,0);
 
-	std::vector<double> selectionfitness(NP), cumsum(NP), cumsumTemp(NP);
-	std::vector <int> selection(2*NP); /* Parent pairs for selection */
+  std::vector<double> selectionfitness(NP), cumsum(NP), cumsumTemp(NP);
+  std::vector <int> selection(2*NP); /* Parent pairs for selection */
 
-	int tempID;
-	std::vector<int> fitnessID(NP);
+  std::vector<int> fitnessID(NP);
 
-	// Initialise the chromosomes and their fitness to that of the initial deme
-	for (pagmo::population::size_type i = 0; i<NP; i++ ) {
-		X[i]	=	pop.get_individual(i).cur_x;
-		fit[i]	=	pop.get_individual(i).cur_f;
-	}
+  // Initialise the chromosomes and their fitness to that of the initial deme
+  for (pagmo::population::size_type i = 0; i<NP; i++ ) {
+    X[i]  =  pop.get_individual(i).cur_x;
+    fit[i]  =  pop.get_individual(i).cur_f;
+  }
 
-	// Find the best member and store in bestX and bestfit
-	double bestidx = pop.get_best_idx();
-	bestX = pop.get_individual(bestidx).cur_x;
-	bestfit = pop.get_individual(bestidx).cur_f;
+  // Find the best member and store in bestX and bestfit
+  double bestidx = pop.get_best_idx();
+  bestX = pop.get_individual(bestidx).cur_x;
+  bestfit = pop.get_individual(bestidx).cur_f;
 
 
-	// Main birmingham_ga loop
-	for (int j = 0; j<m_gen; j++) {
+  // Main birmingham_ga loop
+  for (int j = 0; j<m_gen; j++) {
 
-		switch (m_sel)
+    switch (m_selection_type)
     {
-      case selection::BEST20: { //selects the best 20% and puts multiple copies in Xnew
-        //Sort the individuals according to their fitness
-        for (pagmo::population::size_type i=0; i<NP; i++) fitnessID[i]=i;
-        for (pagmo::population::size_type i=0; i < (NP-1); ++i) {
-          for (pagmo::population::size_type j=i+1; j<NP; ++j) {
-            if ( prob.compare_fitness(fit[j],fit[i]) ) {
-              //swap fitness values
-              fit[i].swap(fit[j]);
-              //swap id's
-              tempID = fitnessID[i];
-              fitnessID[i] = fitnessID[j];
-              fitnessID[j] = tempID;
-            }
-          }
-        }
-        int best20 = NP/5;
-        for (pagmo::population::size_type i=0; i<NP; ++i) {
-          selection[i] = fitnessID[i % best20];
-        }
-      }
-      break;
-
       case selection::ROULETTE: {
         //We scale all fitness values from 0 (worst) to absolute value of the best fitness
         fitness_vector worstfit=fit[0];
@@ -445,8 +602,8 @@ void birmingham_ga::evolve(population &pop) const
           /* Find two best parents from tournament pool */
           {
             fitness_vector threshold_fit;
-            int parent1 = 0;
-            int parent2 = 1;
+            int parent1 = tournament_pool[0];
+            int parent2 = tournament_pool[1];
 
             if (prob.compare_fitness(fit[parent2], fit[parent1]))
             {
@@ -483,30 +640,29 @@ void birmingham_ga::evolve(population &pop) const
       break;
     }
 
-		//Xnew stores the new selected generation of chromosomes
-		for (pagmo::population::size_type i = 0; i < NP; i++) {
-			Xnew[i]=X[selection[i]];
-		}
+    //Xnew stores the new selected generation of chromosomes
+    for (pagmo::population::size_type i = 0; i < NP; i++) {
+      Xnew[i]=X[selection[i]];
+    }
 
-		//2 - Crossover
-		{
-			int L;
-			decision_vector  member1,member2;
+    //2 - Crossover
+    {
+      decision_vector  member1,member2;
       pagmo::population::size_type i = 0;
 
-			while (i < selection.size())
+      while (i < selection.size())
       {
-				member1 = X[selection[i]];
-				member2 = X[selection[i+1]];
-				//and we operate crossover
-				switch (m_cro)
+        member1 = X[selection[i]];
+        member2 = X[selection[i+1]];
+        //and we operate crossover
+        switch (m_crossover_type)
         {
             //0 - binomial crossover
           case crossover::BINOMIAL:
           {
             size_t n = boost::uniform_int<int>(0,D-1)(m_urng);
             for (size_t L = 0; L < D; ++L) { /* perform D binomial trials */
-              if ((m_drng() < m_cr) || L + 1 == D) { /* change at least one parameter */
+              if ((m_drng() < m_crossover_rate) || L + 1 == D) { /* change at least one parameter */
                 member1[n] = member2[n];
               }
               n = (n+1)%D;
@@ -514,147 +670,123 @@ void birmingham_ga::evolve(population &pop) const
           }
           break;
 
-          //1 - exponential crossover
-          case crossover::EXPONENTIAL:
-          {
-            size_t n = boost::uniform_int<int>(0,D-1)(m_urng);
-            L = 0;
-            do {
-              member1[n] = member2[n];
-              n = (n+1) % D;
-              L++;
-            }  while ( (m_drng() < m_cr) && (L < boost::numeric_cast<int>(D)) );
-          }
-          break;
-
           case crossover::CUT_AND_SPLICE:
           {
-            this->do_cut_and_splice(member1, member2);
+            decision_vector tmp1;
+            decision_vector tmp2;
+            do
+            {
+              tmp1 = member1;
+              tmp2 = member2;
+              this->do_cut_and_splice(tmp1, tmp2);
+
+              if (!check_cluster(tmp1))
+              {
+                continue;
+              }
+
+              minimize_cluster(tmp1, prob);
+            }
+            while (!check_cluster(tmp1));
+
+            member1 = tmp1;
           }
           break;
         }
-				Xnew[i/2] = member1;
+        Xnew[i/2] = member1;
         i += 2;
-			}
+      }
     }
 
-		//3 - Mutation
-		switch (m_mut.m_type) {
-      case mutation::GAUSSIAN:
-      {
-        boost::normal_distribution<double> dist;
-        boost::variate_generator<boost::lagged_fibonacci607 &, boost::normal_distribution<double> > delta(m_drng,dist);
-        for (pagmo::problem::base::size_type k = 0; k < Dc;k++) { //for each continuous variable
-          double std = (ub[k]-lb[k]) * m_mut.m_width;
-          for (pagmo::population::size_type i = 0; i < NP;i++) { //for each individual
-            if (m_drng() < m_m) {
-              double mean = Xnew[i][k];
-              double tmp = (delta() * std + mean);
-              if ( (tmp < ub[k]) &&  (tmp > lb[k]) ) Xnew[i][k] = tmp;
-            }
-          }
-        }
-        for (pagmo::problem::base::size_type k = Dc; k < D;k++) { //for each integer variable
-          double std = (ub[k]-lb[k]) * m_mut.m_width;
-          for (pagmo::population::size_type i = 0; i < NP;i++) { //for each individual
-            if (m_drng() < m_m) {
-              double mean = Xnew[i][k];
-              double tmp = boost::math::iround(delta() * std + mean);
-              if ( (tmp < ub[k]) &&  (tmp > lb[k]) ) Xnew[i][k] = tmp;
-            }
-          }
-        }
-      }
-      break;
+    //3 - Mutation
+    //switch (m_mut.m_type) {
+      //case mutation::GAUSSIAN:
+      //{
+        //boost::normal_distribution<double> dist;
+        //boost::variate_generator<boost::lagged_fibonacci607 &, boost::normal_distribution<double> > delta(m_drng,dist);
+        //for (pagmo::problem::base::size_type k = 0; k < Dc;k++) { //for each continuous variable
+          //double std = (ub[k]-lb[k]) * m_mut.m_width;
+          //for (pagmo::population::size_type i = 0; i < NP;i++) { //for each individual
+            //if (m_drng() < m_m) {
+              //double mean = Xnew[i][k];
+              //double tmp = (delta() * std + mean);
+              //if ( (tmp < ub[k]) &&  (tmp > lb[k]) ) Xnew[i][k] = tmp;
+            //}
+          //}
+        //}
+        //for (pagmo::problem::base::size_type k = Dc; k < D;k++) { //for each integer variable
+          //double std = (ub[k]-lb[k]) * m_mut.m_width;
+          //for (pagmo::population::size_type i = 0; i < NP;i++) { //for each individual
+            //if (m_drng() < m_m) {
+              //double mean = Xnew[i][k];
+              //double tmp = boost::math::iround(delta() * std + mean);
+              //if ( (tmp < ub[k]) &&  (tmp > lb[k]) ) Xnew[i][k] = tmp;
+            //}
+          //}
+        //}
+      //}
+      //break;
 
-      case mutation::RANDOM:
-      {
-        for (pagmo::population::size_type i = 0; i < NP;i++) {
-          for (pagmo::problem::base::size_type j = 0; j < Dc;j++) { //for each continuous variable
-            if (m_drng() < m_m) {
-              Xnew[i][j] = boost::uniform_real<double>(lb[j],ub[j])(m_drng);
-            }
-          }
-          for (pagmo::problem::base::size_type j = Dc; j < D;j++) {//for each integer variable
-            if (m_drng() < m_m) {
-              Xnew[i][j] = boost::uniform_int<int>(lb[j],ub[j])(m_urng);
-            }
-          }
-        }
-      }
-      break;
+      //case mutation::RANDOM:
+      //{
+        //for (pagmo::population::size_type i = 0; i < NP;i++) {
+          //for (pagmo::problem::base::size_type j = 0; j < Dc;j++) { //for each continuous variable
+            //if (m_drng() < m_m) {
+              //Xnew[i][j] = boost::uniform_real<double>(lb[j],ub[j])(m_drng);
+            //}
+          //}
+          //for (pagmo::problem::base::size_type j = Dc; j < D;j++) {//for each integer variable
+            //if (m_drng() < m_m) {
+              //Xnew[i][j] = boost::uniform_int<int>(lb[j],ub[j])(m_urng);
+            //}
+          //}
+        //}
+      //}
+      //break;
 
-      case mutation::ATOMIC:
-      {
-        /* no mutation */
-      }
-      break;
-		}
+      //case mutation::ATOMIC:
+      //{
+        //[> no mutation <]
+      //}
+      //break;
+    //}
 
-		// If the problem is a stochastic optimization chage the seed and re-evaluate taking care to update also best and local bests
-		try
-		{
-			//4 - Evaluate the new population (stochastic problem)
-			dynamic_cast<const pagmo::problem::base_stochastic &>(prob).set_seed(m_urng());
-			pop.clear(); // Removes memory based on different seeds (champion and best_x, best_f, best_c)
-			
-			// We re-evaluate the best individual (for elitism)
-			prob.objfun(bestfit,bestX);
-			// Re-evaluate wrt new seed the particle position and memory
-			for (pagmo::population::size_type i = 0; i < NP;i++) {
-				// We evaluate here the new individual fitness
-				prob.objfun(fit[i],Xnew[i]);
-				// We update the velocity (in case coupling with PSO via archipelago)
-				//dummy = Xnew[i];
-				//std::transform(dummy.begin(), dummy.end(), pop.get_individual(i).cur_x.begin(), dummy.begin(),std::minus<double>());
-				///We now set the cleared pop. cur_x is the best_x, re-evaluated with new seed.
-				pop.push_back(Xnew[i]);
-				//pop.set_v(i,dummy);
-				if (prob.compare_fitness(fit[i], bestfit)) {
-					bestfit = fit[i];
-					bestX = Xnew[i];
-				}
-			}
-		}
-		catch (const std::bad_cast& e)
-		{
-			//4 - Evaluate the new population (deterministic problem)
-			for (pagmo::population::size_type i = 0; i < NP;i++) {
-				prob.objfun(fit[i],Xnew[i]);
-				dummy = Xnew[i];
-				std::transform(dummy.begin(), dummy.end(), pop.get_individual(i).cur_x.begin(), dummy.begin(),std::minus<double>());
-				//updates x and v (cache avoids to recompute the objective function and constraints)
-				pop.set_x(i,Xnew[i]);
-				pop.set_v(i,dummy);
-				if (prob.compare_fitness(fit[i], bestfit)) {
-					bestfit = fit[i];
-					bestX = Xnew[i];
-				}
-			}
-		}
-		
-		//5 - Reinsert best individual every m_elitism generations
-		if (j % m_elitism == 0) {
-			int worst=0;
-			for (pagmo::population::size_type i = 1; i < NP;i++) {
-				if ( prob.compare_fitness(fit[worst],fit[i]) ) worst=i;
-			}
-			Xnew[worst] = bestX;
-			fit[worst] = bestfit;
-			dummy = Xnew[worst];
-			std::transform(dummy.begin(), dummy.end(), pop.get_individual(worst).cur_x.begin(), dummy.begin(),std::minus<double>());
-			//updates x and v (cache avoids to recompute the objective function)
-			pop.set_x(worst,Xnew[worst]);
-			pop.set_v(worst,dummy);
-		}
-		X = Xnew;
-	} // end of main birmingham_ga loop
+    //4 - Evaluate the new population (deterministic problem)
+    for (pagmo::population::size_type i = 0; i < NP;i++) {
+      prob.objfun(fit[i],Xnew[i]);
+      dummy = Xnew[i];
+      std::transform(dummy.begin(), dummy.end(), pop.get_individual(i).cur_x.begin(), dummy.begin(),std::minus<double>());
+      //updates x and v (cache avoids to recompute the objective function and constraints)
+      pop.set_x(i,Xnew[i]);
+      pop.set_v(i,dummy);
+      if (prob.compare_fitness(fit[i], bestfit)) {
+        bestfit = fit[i];
+        bestX = Xnew[i];
+      }
+    }
+    
+    //5 - Reinsert best individual every m_elitism generations
+    if (j % m_elitism == 0) {
+      int worst=0;
+      for (pagmo::population::size_type i = 1; i < NP;i++) {
+        if ( prob.compare_fitness(fit[worst],fit[i]) ) worst=i;
+      }
+      Xnew[worst] = bestX;
+      fit[worst] = bestfit;
+      dummy = Xnew[worst];
+      std::transform(dummy.begin(), dummy.end(), pop.get_individual(worst).cur_x.begin(), dummy.begin(),std::minus<double>());
+      //updates x and v (cache avoids to recompute the objective function)
+      pop.set_x(worst,Xnew[worst]);
+      pop.set_v(worst,dummy);
+    }
+    X = Xnew;
+  } // end of main birmingham_ga loop
 }
 
 /// Algorithm name
 std::string birmingham_ga::get_name() const
 {
-	return "Birmingham Genetic Algorithm for molecular clusters";
+  return "Birmingham Genetic Algorithm for molecular clusters";
 }
 
 /// Extra human readable algorithm info.
@@ -663,60 +795,37 @@ std::string birmingham_ga::get_name() const
  */
 std::string birmingham_ga::human_readable_extra() const
 {
-	std::ostringstream s;
-	s << "gen:" << m_gen << ' ';
-	s << "CR:" << m_cr << ' ';
-	s << "M:" << m_m << ' ';
-	s << "elitism:" << m_elitism << ' ';
-	s << "mutation:";
-	switch (m_mut.m_type) {
-		case mutation::RANDOM: {
-		      s << "RANDOM "; 
-		      break;
-		      }
-		case mutation::GAUSSIAN: {
-		      s << "GAUSSIAN (" << m_mut.m_width << ") "; 
-		      break;
-		      }
-		case mutation::ATOMIC: {
-		      s << "ATOMIC "; 
-		      break;
-		      }
-	}
-	s << "selection:";
-	switch (m_sel) {
-		case selection::BEST20: {
-		      s << "BEST20 "; 
-		      break;
-		      }
-		case selection::ROULETTE: {
-		      s << "ROULETTE "; 
-		      break;
-		      }
-		case selection::TOURNAMENT: {
-		      s << "TOURNAMENT "; 
-		      break;
-		      }
-	}
-	s << "crossover:";
-	switch (m_cro) {
-		case crossover::EXPONENTIAL: {
-		      s << "EXPONENTIAL "; 
-		      break;
-		      }
-		case crossover::BINOMIAL: {
-		      s << "BINOMIAL "; 
-		      break;
-		      }
-		case crossover::CUT_AND_SPLICE: {
-		      s << "CUT_AND_SPLICE "; 
-		      break;
-		      }
-	}
+  std::ostringstream s;
+  s << "gen:" << m_gen << ' ';
+  s << "CR:" << m_crossover_rate << ' ';
+  s << "elitism:" << m_elitism << ' ';
 
-	return s.str();
+  s << "selection:";
+  switch (m_selection_type) {
+    case selection::ROULETTE: {
+          s << "ROULETTE "; 
+          break;
+          }
+    case selection::TOURNAMENT: {
+          s << "TOURNAMENT "; 
+          break;
+          }
+  }
+  s << "crossover:";
+  switch (m_crossover_type) {
+    case crossover::BINOMIAL: {
+          s << "BINOMIAL "; 
+          break;
+          }
+    case crossover::CUT_AND_SPLICE: {
+          s << "CUT_AND_SPLICE "; 
+          break;
+          }
+  }
+
+  return s.str();
 }
 
 }} //namespaces
 
-BOOST_CLASS_EXPORT_IMPLEMENT(pagmo::algorithm::birmingham_ga);
+//BOOST_CLASS_EXPORT_IMPLEMENT(pagmo::algorithm::birmingham_ga);

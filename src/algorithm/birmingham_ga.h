@@ -41,7 +41,7 @@ namespace pagmo { namespace algorithm {
  * and some common mutation and crossover strategies, hence the name Simple Genetic Algorithm.
  *
  * Mutation is gaussian or random, crossover exponential or binomial and selection is tournament or
- * best20 (i.e. 20% best of the population is selcted and reproduced 5 times).
+ * roulette wheel.
  *
  * The algorithm works on single objective, box constrained problems. The mutation operator acts
  * differently on continuous and discrete variables.
@@ -56,43 +56,35 @@ public:
 	/// Selection info
 	struct selection {
 		/// Selection type, best 20% or roulette
-		enum type {BEST20 = 0,ROULETTE = 1, TOURNAMENT = 2};
+		enum type {ROULETTE = 1, TOURNAMENT = 2};
 	};
 	/// Mutation operator info
 	struct mutation {
-			/// Mutation type, gaussian or random
-			enum type {GAUSSIAN = 0, RANDOM = 1, ATOMIC = 2};
-			/// Constructor
-			/**
-			* \param[in] t the mutation type
-			* \param[in] width the width of the gaussian bell in case of a gaussian mutation. The
-			*		parameter is otherwise ignored. width is a percentage with respect to the
-			*		ub[i]-lb[i] width.
-			*/
-			mutation(mutation::type t, double width) : m_type(t),m_width(width) {}
 			/// Mutation type
-			type m_type;
+			enum type {MOVE, ROTATE, REPLACE, MUTATIONS_CNT};
+			/// Mutation type
+			type type;
 			/// Mutation width
-			double m_width;
-		private:
-			friend class boost::serialization::access;
-			template <class Archive>
-			void serialize(Archive &ar, const unsigned int)
-			{
-				ar & m_type;
-				ar & m_width;
-			}
+			double probability;
 	};
 
 	/// Crossover operator info
 	struct crossover {
-		/// Crossover type, binomial or exponential
-		enum type {BINOMIAL = 0, EXPONENTIAL = 1, CUT_AND_SPLICE = 2};
+		/// Crossover type, binomial or "cut and splice"
+		enum type {BINOMIAL = 0, CUT_AND_SPLICE = 2};
 	};
-	birmingham_ga(int gen  = 1, const double &cr = .95, const double &m = .02, int elitism = 1,
-	    mutation::type mut  = mutation::ATOMIC, double width = 0.1,
-	    selection::type sel = selection::TOURNAMENT,
-	    crossover::type cro = crossover::CUT_AND_SPLICE, const double &max_coord = 15);
+	birmingham_ga(const int gen,
+      const double &crossover_rate,
+      const double &binom_rate,
+      const double &min_atom_dist,
+	    mutation *muts,
+      int mut_count,
+      int elitism,
+	    selection::type sel,
+	    crossover::type cro,
+      const double &max_coord,
+      const double &bfgs_step_size,
+      const double &bfgs_tol);
 	base_ptr clone() const;
 	void evolve(population &) const;
 	std::string get_name() const;
@@ -101,6 +93,8 @@ protected:
 	std::string human_readable_extra() const;
 private:
   void do_cut_and_splice(decision_vector &vec1, decision_vector &vec2) const;
+  bool check_cluster(decision_vector &x) const;
+  void make_rotation(decision_vector &vec, rng_double &rng) const;
 
 	friend class boost::serialization::access;
 	template <class Archive>
@@ -108,29 +102,28 @@ private:
 	{
 		ar & boost::serialization::base_object<base>(*this);
 		ar & const_cast<int &>(m_gen);
-		ar & const_cast<double &>(m_cr);
-		ar & const_cast<double &>(m_m);
+		ar & const_cast<double &>(m_crossover_rate);
 		ar & const_cast<int &>(m_elitism);
-		ar & const_cast<mutation &>(m_mut);
-		ar & const_cast<selection::type &>(m_sel);
-		ar & const_cast<crossover::type &>(m_cro);
+		ar & const_cast<selection::type &>(m_selection_type);
+		ar & const_cast<crossover::type &>(m_crossover_type);
 	}  
 	//Number of generations
-	const int m_gen;
+	int m_gen;
 	//Crossover rate
-	const double m_cr;
-	//Mutation rate
-	const double m_m;
+	double m_crossover_rate;
+  double m_binom_rate;
 
 	//Elitism (number of generations after which to reinsert the best)
-	const int m_elitism;
-	//Mutation
-	const mutation m_mut;
-	//Selection_type
-	const selection::type m_sel;
-	//Crossover_type
-	const crossover::type m_cro;
-  const double m_max_coord;
+	int m_elitism;
+  double m_min_atom_dist;
+	selection::type m_selection_type;
+	crossover::type m_crossover_type;
+  double m_max_coord;
+  double m_bfgs_step_size;
+  double m_bfgs_tol;
+  //Possible mutations
+  mutation m_mutations[mutation::MUTATIONS_CNT];
+  int m_mut_count;
 };
 
 }} //namespaces

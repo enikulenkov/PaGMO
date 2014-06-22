@@ -450,6 +450,7 @@ return base_ptr(new derived_problem(*this));
 		void objfun(fitness_vector &, const decision_vector &) const;
 		bool compare_fitness(const fitness_vector &, const fitness_vector &) const;
 		void reset_caches() const;
+    virtual void d_objfun(const double *vec, int vec_size, double *df) const {(void)vec; (void)vec_size; (void)df;};
 	public:
 		const std::vector<constraint_vector>& get_best_c(void) const;
 		const std::vector<decision_vector>& get_best_x(void) const;
