@@ -1,0 +1,23 @@
+Cmake python problem:
+http://stackoverflow.com/questions/15291500/i-have-2-versions-of-python-installed-but-cmake-is-using-older-version-how-do
+
+Make Cmake verbose:
+make VERBOSE=1
+
+Pagmo site:
+http://sourceforge.net/projects/pagmo/
+
+Pagmo docs:
+http://pagmo.sourceforge.net/pagmo/
+
+Deinstallation:
+rm -rf /usr/local/lib/libpagmo*
+rm -rf /usr/local/include/pagmo
+rm -rf /usr/local/lib/python2.7/site-packages/PyGMO
+
+Bugs:
+Incorrect comments in one file (something with hv)
+Incorrect example in main page documentation:
+  arch = archipelago(prob, algo, 8, 20, topology.ring())
+Don't copy headers from src/Eigen folder
+find . -maxdepth 1 -type f | grep -v CmakeLists.txt | while read i ; do sudo cp $i /usr/include/pagmo/Eigen ; done
