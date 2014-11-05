@@ -5,7 +5,7 @@ Make Cmake verbose:
 make VERBOSE=1
 
 Pagmo site:
-http://sourceforge.net/projects/pagmo/
+http://esa.github.io/pygmo
 
 Pagmo docs:
 http://pagmo.sourceforge.net/pagmo/
