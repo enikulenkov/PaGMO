@@ -49,15 +49,17 @@
 
 namespace pagmo { namespace algorithm {
 
+void matr_vector_mult(double *matr, double *vec);
+
 birmingham_ga::birmingham_ga(const int gen,
       const double &crossover_rate,
       const double &binom_rate,
       const double &min_atom_dist,
-	    mutation *muts,
+      mutation *muts,
       int mut_count,
       int elitism,
-	    selection::type sel,
-	    crossover::type cro,
+      selection::type sel,
+      crossover::type cro,
       const double &max_coord,
       const double &bfgs_step_size,
       const double &bfgs_tol)
@@ -116,18 +118,107 @@ bool birmingham_ga::check_cluster(decision_vector &x) const
 }
 
 
-void birmingham_ga::randomize_cluster(decision_vector &x)
+void birmingham_ga::randomize_cluster(decision_vector &x) const
 {
   boost::uniform_real<double> rand_coord(-m_max_coord, m_max_coord);
-  double step = 0.5;
-  int step_count = m_max_coord * 2 / step;
-  boost::random::mt19937 rng;
-  boost::random::uniform_int_distribution<> rand_dist(0,step_count);
-  boost::uniform_real<double> rand_angle(0, 2*3.1415);
 
-  for (population::size_type i = 0; i < x.size(); i++)
+  do
   {
-    x[i] = m_max_coord * (-1) + rand_dist(rng) * step;
+    for (population::size_type i = 0; i < x.size(); i++)
+    {
+      x[i] = rand_coord(m_drng);
+    }
+  }
+  while (!check_cluster(x));
+}
+
+
+void birmingham_ga::mutation_move(decision_vector &x) const
+{
+  int atoms_cnt = x.size()/COORDS_CNT;
+  boost::uniform_real<double> rand_coord(-m_max_coord, m_max_coord);
+
+  /* Move every 3rd atom */
+  for (int i=0; i < atoms_cnt; i+=3)
+  {
+     x[i*COORDS_CNT] = rand_coord(m_drng);
+     x[i*COORDS_CNT + 1] = rand_coord(m_drng);
+     x[i*COORDS_CNT + 2] = rand_coord(m_drng);
+  }
+}
+
+
+void birmingham_ga::mutation_rotate(decision_vector &x) const
+{
+  boost::uniform_real<double> rand_angle(0, 2*3.1415);
+  const int n = 3;
+  double phi;
+  double cos_phi;
+  double sin_phi;
+
+  double rot_matr[3*3];
+
+  /* Rotation along Z axis */
+  /* cos_phi  -sin_phi 0
+   * sin_phi   cos_phi 0
+   *    0         0    1  */
+  phi = rand_angle(m_drng);
+  cos_phi = cos(phi);
+  sin_phi = sin(phi);
+
+  memset(rot_matr, 0, sizeof(rot_matr));
+  rot_matr[0] = cos_phi;
+  rot_matr[1] = -sin_phi;
+  rot_matr[n] = sin_phi;
+  rot_matr[n+1] = cos_phi;
+  rot_matr[2*n+2] = 1;
+
+  for (population::size_type i=0; i < x.size(); i+=3)
+  {
+    /* Rotate upper part of atoms (Z > 0) */
+    if (x[i+2] > 0)
+    {
+      matr_vector_mult(rot_matr, &x[i]);
+    }
+  }
+}
+
+
+void birmingham_ga::possibly_mutate(decision_vector &x) const
+{
+  for (int i=0; i < m_mut_count; i++)
+  {
+    double r1 = m_drng();
+
+    if (r1 < m_mutations[i].probability)
+    {
+      switch (m_mutations[i].type)
+      {
+        case mutation::MOVE:
+        {
+          mutation_move(x);
+        }
+        break;
+
+        case mutation::ROTATE:
+        {
+          mutation_rotate(x);
+        }
+        break;
+
+        case mutation::REPLACE:
+        {
+          randomize_cluster(x);
+        }
+        break;
+
+        default:
+          break;
+      }
+
+      /* Do only one mutation */
+      break;
+    }
   }
 }
 
@@ -170,8 +261,6 @@ void birmingham_ga::make_rotation(decision_vector &vec) const
   double cos_phi;
   double sin_phi;
   const int n = 3;
-
-  decision_vector vec_copy = vec;
 
   double rot_matr[3*3];
 
@@ -512,9 +601,8 @@ void birmingham_ga::evolve(population &pop) const
   decision_vector bestX(D,0);
 
   std::vector<double> selectionfitness(NP), cumsum(NP), cumsumTemp(NP);
-  std::vector <int> selection(2*NP); /* Parent pairs for selection */
+  std::vector <int> selection(2*NP*m_crossover_rate); /* Parent pairs for selection */
 
-  std::vector<int> fitnessID(NP);
 
   // Initialise the chromosomes and their fitness to that of the initial deme
   for (pagmo::population::size_type i = 0; i<NP; i++ ) {
@@ -698,58 +786,39 @@ void birmingham_ga::evolve(population &pop) const
       }
     }
 
-    //3 - Mutation
-    //switch (m_mut.m_type) {
-      //case mutation::GAUSSIAN:
-      //{
-        //boost::normal_distribution<double> dist;
-        //boost::variate_generator<boost::lagged_fibonacci607 &, boost::normal_distribution<double> > delta(m_drng,dist);
-        //for (pagmo::problem::base::size_type k = 0; k < Dc;k++) { //for each continuous variable
-          //double std = (ub[k]-lb[k]) * m_mut.m_width;
-          //for (pagmo::population::size_type i = 0; i < NP;i++) { //for each individual
-            //if (m_drng() < m_m) {
-              //double mean = Xnew[i][k];
-              //double tmp = (delta() * std + mean);
-              //if ( (tmp < ub[k]) &&  (tmp > lb[k]) ) Xnew[i][k] = tmp;
-            //}
-          //}
-        //}
-        //for (pagmo::problem::base::size_type k = Dc; k < D;k++) { //for each integer variable
-          //double std = (ub[k]-lb[k]) * m_mut.m_width;
-          //for (pagmo::population::size_type i = 0; i < NP;i++) { //for each individual
-            //if (m_drng() < m_m) {
-              //double mean = Xnew[i][k];
-              //double tmp = boost::math::iround(delta() * std + mean);
-              //if ( (tmp < ub[k]) &&  (tmp > lb[k]) ) Xnew[i][k] = tmp;
-            //}
-          //}
-        //}
-      //}
-      //break;
+    /* Best individuals from current population, possibly mutated */
+    {
+      std::vector<int> fitnessID(NP);
+      int tempID;
+      int k;
+      //Sort the individuals according to their fitness
+      for (pagmo::population::size_type i=0; i<NP; i++)
+        fitnessID[i]=i;
 
-      //case mutation::RANDOM:
-      //{
-        //for (pagmo::population::size_type i = 0; i < NP;i++) {
-          //for (pagmo::problem::base::size_type j = 0; j < Dc;j++) { //for each continuous variable
-            //if (m_drng() < m_m) {
-              //Xnew[i][j] = boost::uniform_real<double>(lb[j],ub[j])(m_drng);
-            //}
-          //}
-          //for (pagmo::problem::base::size_type j = Dc; j < D;j++) {//for each integer variable
-            //if (m_drng() < m_m) {
-              //Xnew[i][j] = boost::uniform_int<int>(lb[j],ub[j])(m_urng);
-            //}
-          //}
-        //}
-      //}
-      //break;
+      for (pagmo::population::size_type i=0; i < (NP-1); ++i)
+      {
+        for (pagmo::population::size_type j=i+1; j<NP; ++j)
+        {
+          if ( prob.compare_fitness(fit[j],fit[i]) )
+          {
+            //swap fitness values
+            fit[i].swap(fit[j]);
+            //swap id's
+            tempID = fitnessID[i];
+            fitnessID[i] = fitnessID[j];
+            fitnessID[j] = tempID;
+          }
+        }
+      }
 
-      //case mutation::ATOMIC:
-      //{
-        //[> no mutation <]
-      //}
-      //break;
-    //}
+      k = 0;
+
+      for (pagmo::population::size_type i=selection.size()/2; i<NP; ++i)
+      {
+        possibly_mutate(X[fitnessID[k++]]);
+        Xnew[i] = X[fitnessID[k++]];
+      }
+    }
 
     //4 - Evaluate the new population (deterministic problem)
     for (pagmo::population::size_type i = 0; i < NP;i++) {
